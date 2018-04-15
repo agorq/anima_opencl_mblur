@@ -1,0 +1,429 @@
+FuRegisterClass("AnimaOpenCLMBlur", CT_Tool, {
+	REGS_Category = "OpenCL",
+	REGS_OpIconString = "OCL",
+	REGS_OpDescription = "Anima OpenCL Motion Blur Fuse",
+	REG_NoMotionBlurCtrls = true,
+})
+
+
+clsource = [[
+#pragma __CL_VERSION_1_2
+
+//
+// Calculates the area of the given box
+//
+float Area(float2 bboxMin, float2 bboxMax){
+	return (bboxMax.x - bboxMin.x) * (bboxMax.y - bboxMin.y);
+}
+
+
+//
+// Checks if the point is inside the given bbox
+//
+bool InsideBBox(float2 BBoxMin, float2 BBoxMax, float2 Point){
+	if (BBoxMin.x <= Point.x && Point.x <= BBoxMax.x){
+		if (BBoxMin.y <= Point.y && Point.y <= BBoxMax.y){
+			return true;
+		}
+	}
+	return false;
+}
+
+
+//
+// Calculate the pixel weight of the sampled pixel on to the source pixel by calculating
+// the weighted area of the sampled pixel to the source_pixel
+//
+float CalculateWeight2(
+	float2 sourcePixelPos,
+	float2 sampledPixelPos,
+	float2 motionVector
+){
+
+	// return 0 by default
+	float2 sourceToSampleVector = sourcePixelPos - sampledPixelPos;
+	float sourceToSampleVectorLength = length(sourceToSampleVector);
+	float motionVectorLength = length(motionVector);
+
+	float desired_length;
+	float2 adjustedMotionVector;
+	desired_length = min(motionVectorLength, sourceToSampleVectorLength);
+	
+	adjustedMotionVector = normalize(motionVector) * desired_length; //sourceToSampleVectorLength;
+
+	// find the movedSampledPixelPos
+	float2 movedSampledPixelPos = (float2)(
+		sampledPixelPos.x + adjustedMotionVector.x,
+		sampledPixelPos.y + adjustedMotionVector.y
+	);
+
+	// get the sourceBBoxMin and sourceBBoxMax
+	float2 sourceBBoxMin = (float2)(sourcePixelPos.x - 0.5f, sourcePixelPos.y - 0.5f);
+	float2 sourceBBoxMax = (float2)(sourcePixelPos.x + 0.5f, sourcePixelPos.y + 0.5f);
+
+	// get the MovedSampleBBoxMin and MovedSampleBBoxMax
+	float2 movedSampleBBoxMin = (float2)(movedSampledPixelPos.x - 0.5f, movedSampledPixelPos.y - 0.5f);
+	float2 movedSampleBBoxMax = (float2)(movedSampledPixelPos.x + 0.5f, movedSampledPixelPos.y + 0.5f);
+
+	float2 leftUpperPoint = (float2)(movedSampleBBoxMin.x, movedSampleBBoxMax.y);
+	float2 leftLowerPoint = movedSampleBBoxMin; 
+	float2 rightUpperPoint = movedSampleBBoxMax;
+	float2 rightLowerPoint = (float2)(movedSampleBBoxMax.x, movedSampleBBoxMin.y);
+
+	// find which corner is inside the sourcePixelBBox
+	if (InsideBBox(sourceBBoxMin, sourceBBoxMax, leftUpperPoint)){
+		// use the leftUpperPoint of the SamplePixel and this point
+		// and calculate the area
+		return 2.0f * Area(
+			(float2)(leftUpperPoint.x, sourceBBoxMin.y),
+			(float2)(sourceBBoxMax.x, leftUpperPoint.y)
+		);
+
+	} else if (InsideBBox(sourceBBoxMin, sourceBBoxMax, leftLowerPoint)){
+		// use the leftLowerPoint of the SamplePixel and this point
+		// and calculate the area
+		return 2.0 * Area(
+			leftLowerPoint,
+			sourceBBoxMax
+		);
+
+	} else if (InsideBBox(sourceBBoxMin, sourceBBoxMax, rightUpperPoint)){
+		return 2.0f * Area(
+			sourceBBoxMin,
+			rightUpperPoint
+		);
+
+	} else if (InsideBBox(sourceBBoxMin, sourceBBoxMax, rightLowerPoint)){
+		return 2.0f * Area(
+			(float2)(sourceBBoxMin.x, rightLowerPoint.y),
+			(float2)(rightLowerPoint.x, sourceBBoxMax.y)
+		);
+	}
+
+	// the pixels are not touching each other, so the weight is 0.0
+	return 0.0f;
+}
+
+
+//
+// The Kernel that pre-calculates the motion_vector lengths
+//
+__kernel void calculate_motion_blur_vector_lengths(
+	FuReadImage_t inputVectors,
+	FuWriteImage_t outputImage,
+	int2 dstsize,
+	float motion_vector_scale
+){
+	int2 ipos = (int2)(get_global_id(1), get_global_id(0));
+	float4 motion_vector4 = FuReadImagef(inputVectors, ipos, dstsize) * motion_vector_scale;
+
+	float4 col = (float4)(motion_vector4.x, motion_vector4.y, length(motion_vector4), 0);
+
+	FuWriteImagef(outputImage, ipos, dstsize, col); // image, int2 pixel pos, int2 image size, float4 colour
+}
+
+
+void atomic_add_global(volatile __global float *addr, float val){
+	union{
+		unsigned int u32;
+		float		f32;
+	} next, expected, current;
+	
+	current.f32 = *addr;
+	
+	do{
+		expected.f32 = current.f32;
+		next.f32	 = expected.f32 + val;
+		current.u32  = atomic_cmpxchg( (volatile __global unsigned int *)addr, expected.u32, next.u32);
+	}while( current.u32 != expected.u32 );
+
+}
+
+
+//
+// The Motion Blur Kernel that works in reverse of mblur
+//
+__kernel void straight_mblur(
+	FuReadImage_t inputImage,
+	FuReadImage_t inputVectors,
+	FuWriteImage_t outputImage,
+	int2 dstsize,
+	int step_size,
+	__global float* rBuffer,
+	__global float* gBuffer,
+	__global float* bBuffer,
+	__global float* aBuffer
+){
+
+	int2 ipos = (int2)(get_global_id(1), get_global_id(0));
+	float2 pos = convert_float2(ipos);
+
+	float4 sum = 0.0f;
+
+	// use a maximum window size of 128 pixels
+	float max_sample_dist = 1024.0;
+	float2 motion_vector;
+	float4 motion_vector4;
+	float motion_vector_length;
+
+	// set the pixel color to itself
+	float4 col = FuReadImagef(inputImage, ipos, dstsize);
+	float4 blur_col = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+
+	// find the pixels that is effected by this one
+	// get the motion vector
+	motion_vector4 = FuReadImagef(inputVectors, ipos, dstsize);
+	motion_vector = (float2)(motion_vector4.x, motion_vector4.y);
+	motion_vector_length = min(motion_vector4.z, max_sample_dist);
+
+	// if motion vector of this pixel is soo small
+	// skip it
+	if (motion_vector_length <= 0.001f){
+		return;
+	}
+
+	// step through motion vector with unit vector
+	float2 unit_motion_vector = normalize(motion_vector);
+
+	float2 forward_sample_pos = pos;
+	float2 backward_sample_pos = pos;
+
+	float2 sample_pos_0, sample_pos_1, sample_pos_2, sample_pos_3, sample_pos_4, sample_pos_5;
+	float sample_weight_0, sample_weight_1, sample_weight_2, sample_weight_3, sample_weight_4, sample_weight_5;
+	float4 target_col_0, target_col_1, target_col_2, target_col_3, target_col_4, target_col_5;
+
+	barrier(CLK_LOCAL_MEM_FENCE);
+	for (int i=0; i < motion_vector_length * 0.5f; i++){
+		sample_pos_0 = forward_sample_pos + (float2)(unit_motion_vector.x, 0.0f);
+		sample_pos_1 = forward_sample_pos + unit_motion_vector;
+		sample_pos_2 = forward_sample_pos + (float2)(0.0f, unit_motion_vector.y);
+
+		sample_pos_3 = backward_sample_pos - (float2)(unit_motion_vector.x, 0.0f);
+		sample_pos_4 = backward_sample_pos - unit_motion_vector;
+		sample_pos_5 = backward_sample_pos - (float2)(0.0f, unit_motion_vector.y);
+
+		int2 isample_pos_0 = convert_int(sample_pos_0);
+		int2 isample_pos_1 = convert_int(sample_pos_1);
+		int2 isample_pos_2 = convert_int(sample_pos_2);
+		int2 isample_pos_3 = convert_int(sample_pos_3);
+		int2 isample_pos_4 = convert_int(sample_pos_4);
+		int2 isample_pos_5 = convert_int(sample_pos_5);
+		barrier(CLK_LOCAL_MEM_FENCE);
+		sample_weight_0 = CalculateWeight2(sample_pos_0, pos, unit_motion_vector);
+		sample_weight_1 = CalculateWeight2(sample_pos_1, pos, unit_motion_vector);
+		sample_weight_2 = CalculateWeight2(sample_pos_2, pos, unit_motion_vector);
+
+		sample_weight_3 = CalculateWeight2(sample_pos_3, pos, -unit_motion_vector);
+		sample_weight_4 = CalculateWeight2(sample_pos_4, pos, -unit_motion_vector);
+		sample_weight_5 = CalculateWeight2(sample_pos_5, pos, -unit_motion_vector);
+
+		target_col_0 = col * sample_weight_0;
+		target_col_1 = col * sample_weight_1;
+		target_col_2 = col * sample_weight_2;
+
+		target_col_3 = col * sample_weight_3;
+		target_col_4 = col * sample_weight_4;
+		target_col_5 = col * sample_weight_5;
+		
+		if(!(isample_pos_0.x < 0 || isample_pos_0.y<0 || isample_pos_0.x >= dstsize.x || isample_pos_0.x >= dstsize.x)){
+			atomic_add_global(&rBuffer[isample_pos_0.x+isample_pos_0.y*dstsize.y],target_col_0.x);
+			atomic_add_global(&gBuffer[isample_pos_0.x+isample_pos_0.y*dstsize.y],target_col_0.y);
+			atomic_add_global(&bBuffer[isample_pos_0.x+isample_pos_0.y*dstsize.y],target_col_0.z);
+			atomic_add_global(&aBuffer[isample_pos_0.x+isample_pos_0.y*dstsize.y],target_col_0.w);
+		}
+
+		if(!(isample_pos_1.x < 0 || isample_pos_1.y<0 || isample_pos_1.x >= dstsize.x || isample_pos_1.x >= dstsize.x)){
+			atomic_add_global(&rBuffer[isample_pos_1.x+isample_pos_1.y*dstsize.y],target_col_1.x);
+			atomic_add_global(&gBuffer[isample_pos_1.x+isample_pos_1.y*dstsize.y],target_col_1.y);
+			atomic_add_global(&bBuffer[isample_pos_1.x+isample_pos_1.y*dstsize.y],target_col_1.z);
+			atomic_add_global(&aBuffer[isample_pos_1.x+isample_pos_1.y*dstsize.y],target_col_1.w);
+		}
+
+		if(!(isample_pos_2.x < 0 || isample_pos_2.y<0 || isample_pos_2.x >= dstsize.x || isample_pos_2.x >= dstsize.x)){
+			atomic_add_global(&rBuffer[isample_pos_2.x+isample_pos_2.y*dstsize.y],target_col_2.x);
+			atomic_add_global(&gBuffer[isample_pos_2.x+isample_pos_2.y*dstsize.y],target_col_2.y);
+			atomic_add_global(&bBuffer[isample_pos_2.x+isample_pos_2.y*dstsize.y],target_col_2.z);
+			atomic_add_global(&aBuffer[isample_pos_2.x+isample_pos_2.y*dstsize.y],target_col_2.w);
+		}
+
+		if(!(isample_pos_3.x < 0 || isample_pos_3.y<0 || isample_pos_3.x >= dstsize.x || isample_pos_3.x >= dstsize.x)){
+			atomic_add_global(&rBuffer[isample_pos_3.x+isample_pos_3.y*dstsize.y],target_col_3.x);
+			atomic_add_global(&gBuffer[isample_pos_3.x+isample_pos_3.y*dstsize.y],target_col_3.y);
+			atomic_add_global(&bBuffer[isample_pos_3.x+isample_pos_3.y*dstsize.y],target_col_3.z);
+			atomic_add_global(&aBuffer[isample_pos_3.x+isample_pos_3.y*dstsize.y],target_col_3.w);
+		}
+		if(!(isample_pos_4.x < 0 || isample_pos_4.y<0 || isample_pos_4.x >= dstsize.x || isample_pos_4.x >= dstsize.x)){
+			atomic_add_global(&rBuffer[isample_pos_4.x+isample_pos_4.y*dstsize.y],target_col_4.x);
+			atomic_add_global(&gBuffer[isample_pos_4.x+isample_pos_4.y*dstsize.y],target_col_4.y);
+			atomic_add_global(&bBuffer[isample_pos_4.x+isample_pos_4.y*dstsize.y],target_col_4.z);
+			atomic_add_global(&aBuffer[isample_pos_4.x+isample_pos_4.y*dstsize.y],target_col_4.w);
+		}
+		if(!(isample_pos_5.x < 0 || isample_pos_5.y<0 || isample_pos_5.x >= dstsize.x || isample_pos_5.x >= dstsize.x)){
+			atomic_add_global(&rBuffer[isample_pos_5.x+isample_pos_5.y*dstsize.y],target_col_5.x);
+			atomic_add_global(&gBuffer[isample_pos_5.x+isample_pos_5.y*dstsize.y],target_col_5.y);
+			atomic_add_global(&bBuffer[isample_pos_5.x+isample_pos_5.y*dstsize.y],target_col_5.z);
+			atomic_add_global(&aBuffer[isample_pos_5.x+isample_pos_5.y*dstsize.y],target_col_5.w);
+		}
+		
+
+		atomic_add_global(&rBuffer[ipos.x*dstsize.x+ipos.y],col.x);	
+
+		forward_sample_pos += unit_motion_vector;
+		backward_sample_pos -= unit_motion_vector;
+	}
+	float4 out = (float4)(rBuffer[dstsize.y*ipos.y+ipos.x],0,0,1);
+	FuWriteImagef(outputImage, ipos, dstsize, out);
+}
+]]
+
+function Create()   
+	InImage = self:AddInput("Image", "Image", {
+		LINKID_DataType = "Image",
+		LINK_Main = 1,
+	})
+
+	InVector = self:AddInput("Vector", "Vector", {
+		LINKID_DataType = "Image",
+		LINK_Main = 2,
+	})
+
+	OutImage = self:AddOutput("Output", "Output", {
+		LINKID_DataType = "Image",
+		LINK_Main = 1,
+	})
+
+	InMotionVectorScale = self:AddInput("Motion Vector Scale", "Motion Vector Scale", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_MinScale = 0.0,
+		INP_MaxScale = 10.0,
+		INP_Default = 1.0,
+	})
+
+end
+
+
+function OnAddToFlow()
+	mgr = OCLManager()
+	if mgr then
+		prog = mgr:BuildCachedProgram(self.RegNode, clsource)
+	end
+end
+
+
+function Process(req)
+	local step_size = (req:IsQuick() and 2 or 1)
+	local inimg = InImage:GetValue(req)
+	local invec = InVector:GetValue(req)
+	local motion_vector_scale = InMotionVectorScale:GetValue(req).Value
+
+	-- buffer for calculated motion_vector_lengths
+	local motion_vector_lengths = Image({ IMG_Like = inimg })
+
+	local img = Image({
+		IMG_Like = inimg,
+		IMG_CopyChannels = true,
+	})
+	img = inimg:CopyOf()
+
+	local weight_img = Image({IMG_Like = inimg})
+	-- weight_img = inimg:CopyOf()
+
+	local out
+	local success = false
+
+	if img and prog then
+		local incl = prog:CreateImage(inimg, "read")
+		local vectorcl = prog:CreateImage(invec, "read")
+
+		local motion_vector_lengths_cl = prog:CreateImage(motion_vector_lengths, "readwrite")
+
+		local outcl = prog:CreateImage(img, "readwrite")
+		local weight_img_cl = prog:CreateImage(weight_img, "readwrite")
+
+		if incl and vectorcl and outcl then
+
+			r = {}
+			for i = 1,(inimg.Width * inimg.Height) do
+				r[i] = 0
+			end
+			rBuffer = prog:CreateBuffer(r,"float32","readwrite")
+
+			g = {}
+			for i = 1,(inimg.Width * inimg.Height) do
+				g[i] = 0
+			end
+			gBuffer = prog:CreateBuffer(g,"float32","readwrite")
+
+			b = {}
+			for i = 1,(inimg.Width * inimg.Height) do
+				b[i] = 0
+			end
+			bBuffer = prog:CreateBuffer(b,"float32","readwrite")
+
+			a = {}
+			for i = 1,(inimg.Width * inimg.Height) do
+				a[i] = 0
+			end
+			aBuffer = prog:CreateBuffer(a,"float32","readwrite")
+
+			-- first calculate the motion vector lengths
+			local kernel = prog:CreateKernel("calculate_motion_blur_vector_lengths")
+			if kernel then
+				prog:SetArg(kernel, 0, vectorcl)
+				prog:SetArg(kernel, 1, motion_vector_lengths_cl)
+				prog:SetArgInt(kernel, 2, inimg.Width, inimg.Height)
+				prog:SetArg(kernel, 3, motion_vector_scale)
+
+				success = prog:RunKernel(kernel)
+			end
+
+			-- now run the motion blur kernel
+			if success then
+				local kernel = prog:CreateKernel("straight_mblur")
+				if kernel then
+					prog:SetArg(kernel, 0, incl)
+					prog:SetArg(kernel, 1, motion_vector_lengths_cl)
+					prog:SetArg(kernel, 2, outcl)
+					prog:SetArgInt(kernel, 3, inimg.Width, inimg.Height)
+					prog:SetArgInt(kernel, 4, step_size)
+					prog:SetArg(kernel,5,rBuffer)
+					prog:SetArg(kernel,6,gBuffer)
+					prog:SetArg(kernel,7,bBuffer)
+					prog:SetArg(kernel,8,aBuffer)
+
+					success = prog:RunKernel(kernel)
+					if success then
+						success = prog:Download(outcl, img)
+						if success then
+							out = img
+						end
+					end
+				end
+			end
+		end
+		if incl then
+			incl:ReleaseCLObject()
+		end
+		if vectorcl then
+			vectorcl:ReleaseCLObject()
+		end
+		if outcl then
+			outcl:ReleaseCLObject()
+		end
+		if rBuffer then
+			rBuffer:ReleaseCLObject()
+		end
+		if gBuffer then
+			gBuffer:ReleaseCLObject()
+		end
+		if bBuffer then
+			bBuffer:ReleaseCLObject()
+		end
+		if aBuffer then
+			aBuffer:ReleaseCLObject()
+		end
+	end
+
+	OutImage:Set(req, out)
+end
